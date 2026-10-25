@@ -10,6 +10,7 @@ A Python CLI tool to simplify hydrologic model calibration for NextGen In A Box 
 - [Advanced Options](#advanced-options)
 - [Calibration Process](#calibration-process)
 - [Calibrating for Floods](#calibrating-for-floods)
+- [Stress Testing a Calibration](#stress-testing-a-calibration)
 - [Calibration Configuration File](#calibration-configuration-file)
 - [Example: Calibrating CAMELS Basins](#example-calibrating-camels-basins)
 - [How It Works](#how-it-works)
@@ -79,7 +80,8 @@ usage: ngiab-cal [-h] [-g GAGE] [-f] [--run] [-i ITERATIONS] [--debug] [-w WARMU
                  [--calibration_ratio CALIBRATION_RATIO]
                  [--objective {kge,kge-flood-mean,kge-flood-robust,kge-robust}]
                  [--flood-weight FLOOD_WEIGHT] [--q2-cfs Q2_CFS] [--storm-depth STORM_DEPTH]
-                 [--storm-concentration STORM_CONCENTRATION]
+                 [--storm-concentration STORM_CONCENTRATION] [--stress-test]
+                 [--stress-depth STRESS_DEPTH] [--stress-concentration STRESS_CONCENTRATION]
                  data_folder
 
 Create a calibration config for ngen-cal
@@ -126,6 +128,16 @@ options:
                         Required by the robust objectives. g >= 1: the drier forcing raises the
                         storms' hourly rain to 1/g, spreading it out, the wetter one to g, packing it
                         into the heavier hours; each storm's total is kept before the depth change
+  --stress-test         After calibrating, rerun the best parameters with the storms of the validation
+                        period's floods changed, and report each flood's peak error under every change.
+                        Depth runs in ten equal steps of ln f to 1/d and to d; concentration takes 1/g
+                        and g, alone and with each end of depth: 26 runs beside the unchanged one.
+                        The calibration itself is unchanged
+  --stress-depth STRESS_DEPTH
+                        d >= 1, the stress test's largest change of depth. Default: --storm-depth
+  --stress-concentration STRESS_CONCENTRATION
+                        g >= 1, the stress test's largest change of concentration.
+                        Default: --storm-concentration
 ```
 
 ## Calibration Process
@@ -158,6 +170,28 @@ ngiab-cal writes every flood of the record to `calibration/floods.csv`. ngen-cal
 **Robust objectives.** The drier and wetter forcings change only the precipitation of the calibration period's floods' storms, the seven days either side of each peak: P' = f·s·P^γ, where s holds each catchment's storm total so that γ alone moves rain between hours. The drier forcing takes f = 1/d and γ = 1/g, spreading each storm out; the wetter one f = d and γ = g, packing its rain into the heaviest hours. d and g say how far the forcing's storms may be off in depth and in concentration; at three basins where AORC was compared with the MRMS precipitation products at the calibration storms, d was 1.2 to 1.6 and g 1.1 to 1.3. ngiab-cal writes the two forcings to `calibration/storm_dry.nc` and `calibration/storm_wet.nc`; the realization's forcing must be NetCDF, as the NGIAB preprocessor writes it.
 
 Every iteration of a robust objective runs the model three times at once, each run in its own directory, so it needs up to three times the cores, or up to three times the time, of a KGE iteration, and three times the shared memory. At a basin of 13 catchments over ten years on 6 cores, the first evaluation took 2 min 52 s against 1 min 51 s for KGE alone.
+
+## Stress Testing a Calibration
+
+`--stress-test` asks how far a calibration's flood peaks move when the storm rain is off. It changes nothing about the calibration: after it, the validation run reruns the best parameters with the precipitation of the validation period's floods' storms changed, as the robust objectives change the calibration period's, and reports each flood's peak error under every change. It works with any `--objective`:
+
+```bash
+ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --objective kge-flood-mean --stress-test --stress-depth 2.2 --stress-concentration 1.5
+```
+
+**The changes.** P' = f·s·P^γ as above, over the seven days either side of each validation flood's peak. Depth runs in ten equal steps of ln f from 1/d to d with γ = 1, the grid of Yang et al. (2026, arXiv:2602.05237, Fig. 7); concentration takes γ = 1/g and γ = g, at f = 1 and at each end of depth. That is 26 changed runs beside the unchanged one; a change that repeats another is left out, so g = 1 leaves the 20 of depth. d and g are the largest errors to test, and default to `--storm-depth` and `--storm-concentration`. A robust calibration trains at how far the storms are typically off and is tested at how far they can be, so the stress test's own values are often the larger: at seven basins where AORC was compared with the MRMS precipitation products at the calibration storms, the largest departures were 1.4 to 2.2 in depth and 1.2 to 1.7 in concentration.
+
+**The report.** Beside the validation metrics in `calibration/Output/Validation_Run`:
+
+| File | One row per | Columns |
+|---|---|---|
+| `<gage>_stress_floods_valid_best.csv` | flood and change, change 0 the unchanged storm | `change`, `depth`, `concentration`, `peak_time`, `obs_peak_cms`, `sim_peak_cms`, `sim_peak_time`, `peak_error`, `timing_h` |
+| `<gage>_stress_kge_valid_best.csv` | change | `change`, `depth`, `concentration`, `KGE` over the validation period |
+| `<gage>_stress_summary_valid_best.csv` | flood | `peak_error` under the unchanged storm, `largest_peak_error` under any change and the `largest_at_depth` and `largest_at_concentration` it falls at, and `response`, the slope of ln Q̂ on ln f over the depth changes |
+
+A response of 1 means the simulated peak scales with the storm's depth; above 1, it grows faster than the rain. Q̂ is the largest simulated flow within seven days of the observed peak, so a `timing_h` of days rather than hours says the window's largest flow is not this storm's response: the model missed the flood, or the storm was cut until another event's flow or an earlier recession is larger. Change k is row k of `calibration/stress/changes.csv`, which lists each change's f, γ and forcing.
+
+**Cost.** ngiab-cal writes the 26 forcings to `calibration/stress/` before the calibration starts, each a full copy of the package's forcing, so about 26 times its size on disk; they can be deleted once the validation has run. The validation runs them three at a time, as a robust iteration runs its three, so the stress test needs no more cores than a robust calibration and adds about nine of its iterations' time to the validation. ngiab-cal stops if the validation period has no flood, and the realization's forcing must be NetCDF.
 
 ## Example: Calibrating CAMELS Basins
 
@@ -243,6 +277,12 @@ eval_params:
     storm_forcings:
       - /ngen/ngen/data/calibration/storm_dry.nc
       - /ngen/ngen/data/calibration/storm_wet.nc
+```
+
+`--stress-test` adds the list of its changed forcings:
+
+```yaml
+    stress_test: /ngen/ngen/data/calibration/stress/changes.csv
 ```
 
 These time periods follow the calibration process diagram shown earlier, with separate periods for warmup, calibration, and validation.

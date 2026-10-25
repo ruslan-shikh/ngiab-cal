@@ -101,8 +101,41 @@ def get_arg_parser() -> ArgumentParser:
         "storms' hourly rain to 1/g, spreading it out, the wetter one to g, packing it\n"
         "into the heavier hours; each storm's total is kept before the depth change\n\n",
     )
+    parser.add_argument(
+        "--stress-test",
+        action="store_true",
+        help="After calibrating, rerun the best parameters with the storms of the validation\n"
+        "period's floods changed, and report each flood's peak error under every change.\n"
+        "Depth runs in ten equal steps of ln f to 1/d and to d; concentration takes 1/g\n"
+        "and g, alone and with each end of depth: 26 runs beside the unchanged one.\n"
+        "The calibration itself is unchanged\n\n",
+    )
+    parser.add_argument(
+        "--stress-depth",
+        type=float,
+        help="d >= 1, the stress test's largest change of depth. Default: --storm-depth\n\n",
+    )
+    parser.add_argument(
+        "--stress-concentration",
+        type=float,
+        help="g >= 1, the stress test's largest change of concentration.\n"
+        "Default: --storm-concentration\n\n",
+    )
 
     return parser
+
+
+def stress_ends(args: Namespace) -> tuple[float | None, float | None] | None:
+    """The stress test's d and g, its own or else the robust objectives'; None without the test."""
+    if not args.stress_test:
+        return None
+    depth = args.stress_depth if args.stress_depth is not None else args.storm_depth
+    concentration = (
+        args.stress_concentration
+        if args.stress_concentration is not None
+        else args.storm_concentration
+    )
+    return depth, concentration
 
 
 def check_objective_arguments(parser: ArgumentParser, args: Namespace) -> None:
@@ -119,3 +152,21 @@ def check_objective_arguments(parser: ArgumentParser, args: Namespace) -> None:
         parser.error("--flood-weight is between 0 and 1")
     if args.q2_cfs is not None and args.q2_cfs <= 0:
         parser.error("--q2-cfs is a flow above 0")
+    if not args.stress_test and (args.stress_depth, args.stress_concentration) != (None, None):
+        parser.error("--stress-depth and --stress-concentration apply to --stress-test")
+    ends = stress_ends(args)
+    if ends is not None:
+        if None in ends:
+            parser.error(
+                "--stress-test needs --stress-depth and --stress-concentration, or a robust "
+                "objective's --storm-depth and --storm-concentration"
+            )
+        if min(ends) < 1:
+            parser.error("--stress-depth and --stress-concentration are 1 or more")
+        if max(ends) == 1:
+            parser.error("--stress-test changes nothing when d and g are both 1")
+        if args.calibration_ratio >= 1:
+            parser.error(
+                "--stress-test reads the validation period's floods, and --calibration_ratio 1 "
+                "leaves no validation period"
+            )

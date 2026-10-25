@@ -122,6 +122,14 @@ class FilePaths:
         return self.calibration_folder / "storm_wet.nc"
 
     @property
+    def stress_folder(self) -> Path:
+        return self.calibration_folder / "stress"
+
+    @property
+    def stress_changes(self) -> Path:
+        return self.stress_folder / "changes.csv"
+
+    @property
     def calibrated_realization(self) -> Path:
         return self.calibration_folder / "Output" / "Validation_Run" / "realization.json"
 

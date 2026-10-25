@@ -90,3 +90,38 @@ def test_the_drier_and_wetter_forcings_change_only_the_storms_rain(tmp_path):
         assert (
             w["precip_rate"][:, storm].max("time") > 1.6 * a["precip_rate"][:, storm].max("time")
         ).all()
+
+
+def test_the_stress_grid_steps_depth_evenly_in_its_log_and_crosses_its_ends_with_concentration():
+    changes = storms.stress_changes(1.6, 1.2)
+    assert len(changes) == 26
+    sweep = [f for f, g in changes if g == 1.0]
+    # ten equal steps of ln f to each end; the unchanged storm runs anyway
+    steps = [k / 10 for k in range(-10, 11) if k]
+    assert np.log(sweep) == pytest.approx(np.log(1.6) * np.array(steps))
+    assert [c for c in changes if c[1] != 1.0] == pytest.approx(
+        [(f, g) for f in (1.0, 1 / 1.6, 1.6) for g in (1 / 1.2, 1.2)]
+    )
+
+
+def test_a_stress_grid_without_a_concentration_change_repeats_no_run():
+    assert storms.stress_changes(1.6, 1.0) == [
+        c for c in storms.stress_changes(1.6, 1.2) if c[1] == 1
+    ]
+    assert storms.stress_changes(1.0, 1.2) == pytest.approx([(1.0, 1 / 1.2), (1.0, 1.2)])
+
+
+def test_each_stress_forcing_changes_the_storms_by_its_own_depth(tmp_path):
+    source = tmp_path / "forcings.nc"
+    forcing(rain()).to_netcdf(source)
+    changes = storms.write_stress_forcings(source, [PEAK], 1.6, 1.2, tmp_path)
+    assert changes["forcing"].tolist() == [f"stress_{k:02d}.nc" for k in range(1, 27)]
+    storm = storms.storm_steps(HOURS, [PEAK])[0]
+    outside = np.setdiff1d(np.arange(len(HOURS)), storm)
+    with xr.open_dataset(source) as a:
+        total = a["precip_rate"][:, storm].sum("time").values
+        for depth, name in zip(changes["depth"], changes["forcing"]):
+            with xr.open_dataset(tmp_path / name) as changed:
+                got = changed["precip_rate"][:, storm].sum("time").values
+                assert got == pytest.approx(depth * total, rel=1e-5)
+                assert changed["precip_rate"][:, outside].equals(a["precip_rate"][:, outside])

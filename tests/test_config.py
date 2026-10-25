@@ -9,7 +9,7 @@ import xarray as xr
 import yaml
 
 from ngiab_cal import __main__ as cli
-from ngiab_cal.arguments import check_objective_arguments, get_arg_parser
+from ngiab_cal.arguments import check_objective_arguments, get_arg_parser, stress_ends
 from ngiab_cal.file_paths import FilePaths
 from test_storms import HOURS, forcing, rain
 
@@ -139,3 +139,106 @@ def test_a_robust_objective_with_its_storm_settings_is_accepted():
         "1.0",
     ]
     check_objective_arguments(parser, parser.parse_args(argv))
+
+
+VALIDATION = (PERIOD[1], END)
+
+
+def test_the_stress_test_changes_only_the_validation_floods_storms(tmp_path):
+    files = package(tmp_path)
+    params = cli.write_flood_objective_files(
+        files, "01234567", observed(), PERIOD, "kge", 0.5, 353.0, None, None, (1.6, 1.2), VALIDATION
+    )
+    eval_params = config(files, "kge", params)
+    assert eval_params["objective"] == "kge"
+    assert eval_params["objective_params"] == {
+        "floods": "/ngen/ngen/data/calibration/floods.csv",
+        "flood_weight": 0.5,
+        "stress_test": "/ngen/ngen/data/calibration/stress/changes.csv",
+    }
+    changes = pd.read_csv(files.stress_changes)
+    assert len(changes) == 26
+    assert changes["forcing"].iloc[0] == "/ngen/ngen/data/calibration/stress/stress_01.nc"
+    assert len(list(files.stress_folder.glob("stress_*.nc"))) == 26
+    # only the validation period's flood, peaking on 2020-02-03, has its storm changed
+    with (
+        xr.open_dataset(cli.netcdf_forcing(files)) as a,
+        xr.open_dataset(files.stress_folder / "stress_20.nc") as s,
+    ):
+        changed = (a["precip_rate"] != s["precip_rate"]).any("catchment-id").values
+    assert HOURS[changed].min() >= pd.Timestamp("2020-01-27 00:00")
+    assert not files.drier_forcing.exists()
+
+
+def test_a_kge_calibration_under_the_stress_test_needs_no_calibration_flood(tmp_path):
+    files = package(tmp_path)
+    no_flood = (datetime(2020, 1, 20), datetime(2020, 1, 30))
+    params = cli.write_flood_objective_files(
+        files,
+        "01234567",
+        observed(),
+        no_flood,
+        "kge",
+        0.5,
+        353.0,
+        None,
+        None,
+        (1.6, 1.2),
+        (no_flood[1], END),
+    )
+    assert "stress_test" in params
+
+
+def test_the_stress_test_without_a_validation_flood_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="validation period"):
+        cli.write_flood_objective_files(
+            package(tmp_path),
+            "01234567",
+            observed(),
+            PERIOD,
+            "kge-flood-mean",
+            0.5,
+            353.0,
+            None,
+            None,
+            (1.6, 1.2),
+            (datetime(2020, 1, 26), datetime(2020, 1, 30)),
+        )
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--stress-depth", "1.5", "--stress-concentration", "1.2"],
+        ["--stress-test"],
+        ["--stress-test", "--stress-depth", "1.5"],
+        ["--stress-test", "--stress-depth", "1.5", "--stress-concentration", "0.9"],
+        ["--stress-test", "--stress-depth", "1", "--stress-concentration", "1"],
+        ["--stress-test", "--stress-depth", "1.5", "--stress-concentration", "1.2", "--cr", "1"],
+    ],
+)
+def test_stress_settings_that_do_not_fit_are_refused(argv):
+    parser = get_arg_parser()
+    with pytest.raises(SystemExit):
+        check_objective_arguments(parser, parser.parse_args(["folder", *argv]))
+
+
+def test_the_stress_test_takes_its_own_ends_or_else_the_robust_objectives():
+    parser = get_arg_parser()
+    robust = [
+        "folder",
+        "--objective",
+        "kge-robust",
+        "--storm-depth",
+        "1.5",
+        "--storm-concentration",
+        "1.1",
+        "--stress-test",
+    ]
+    args = parser.parse_args(robust)
+    check_objective_arguments(parser, args)
+    assert stress_ends(args) == (1.5, 1.1)
+    args = parser.parse_args([*robust, "--stress-depth", "2.0"])
+    check_objective_arguments(parser, args)
+    assert stress_ends(args) == (2.0, 1.1)
+    assert stress_ends(parser.parse_args(["folder"])) is None

@@ -1,5 +1,6 @@
 import json
 import logging
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from ngiab_cal.arguments import (
     WARMUP_DEFAULT,
     check_objective_arguments,
     get_arg_parser,
+    stress_ends,
 )
 from ngiab_cal.custom_logging import set_log_level, setup_logging
 from ngiab_cal.file_paths import FilePaths, validate_calibration_files, validate_run_files
@@ -215,7 +217,14 @@ def netcdf_forcing(files: FilePaths) -> Path:
     return (files.data_folder / forcing["path"]).resolve()
 
 
-def objective_params_yaml(flood_weight: float, storm_forcings: list[Path]) -> str:
+def container_path(files: FilePaths, path: Path) -> str:
+    """A file of the calibration folder as the container sees it"""
+    return f"{CONTAINER_CALIBRATION_FOLDER}/{path.relative_to(files.calibration_folder).as_posix()}"
+
+
+def objective_params_yaml(
+    flood_weight: float, storm_forcings: list[Path], stress_changes: str | None = None
+) -> str:
     """The objective_params block of the ngen-cal config, under eval_params"""
     text = (
         f"\n    objective_params:"
@@ -226,6 +235,8 @@ def objective_params_yaml(flood_weight: float, storm_forcings: list[Path]) -> st
         text += "\n      storm_forcings:"
         for path in storm_forcings:
             text += f"\n        - {CONTAINER_CALIBRATION_FOLDER}/{path.name}"
+    if stress_changes:
+        text += f"\n      stress_test: {stress_changes}"
     return text
 
 
@@ -239,9 +250,12 @@ def write_flood_objective_files(
     q2_cfs: float | None,
     storm_depth: float | None,
     storm_concentration: float | None,
+    stress: tuple[float, float] | None = None,
+    validation_period: tuple[datetime, datetime] | None = None,
 ) -> str:
-    """Write the flood list, and the robust objectives' drier and wetter forcings; returns the
-    config's objective_params block"""
+    """Write the flood list, the robust objectives' drier and wetter forcings, and with ``stress``,
+    the stress test's d and g, its changed forcings of the floods of ``validation_period``;
+    returns the config's objective_params block"""
     if q2_cfs is None:
         logging.info(f"Downloading the annual peaks of {gage_id}")
         q2_cfs = floods.two_year_flood_cfs(floods.download_annual_peaks(gage_id))
@@ -253,7 +267,7 @@ def write_flood_objective_files(
     )
     peaks = found["peak_time"]
     in_period = found[(peaks >= period[0]) & (peaks <= period[1])]
-    if in_period.empty:
+    if objective != "kge" and in_period.empty:
         raise ValueError(
             f"No flood above the 2-year flood ({q2_cfs:.0f} ft3/s) is scored in the calibration "
             f"period {period[0]} to {period[1]}"
@@ -272,7 +286,28 @@ def write_flood_objective_files(
             storm_concentration,
             *storm_forcings,
         )
-    return objective_params_yaml(flood_weight, storm_forcings)
+
+    stress_changes = None
+    if stress:
+        held_out = found[(peaks >= validation_period[0]) & (peaks <= validation_period[1])]
+        if held_out.empty:
+            raise ValueError(
+                f"No flood above the 2-year flood ({q2_cfs:.0f} ft3/s) is scored in the validation "
+                f"period {validation_period[0]} to {validation_period[1]}, so the stress test has "
+                f"none to read"
+            )
+        logging.info(f"Writing the stress test's forcings, changing {len(held_out)} floods' storms")
+        shutil.rmtree(files.stress_folder, ignore_errors=True)
+        files.stress_folder.mkdir()
+        changes = storms.write_stress_forcings(
+            netcdf_forcing(files), held_out["peak_time"], *stress, files.stress_folder
+        )
+        changes["forcing"] = [
+            container_path(files, files.stress_folder / f) for f in changes["forcing"]
+        ]
+        changes.to_csv(files.stress_changes, index=False)
+        stress_changes = container_path(files, files.stress_changes)
+    return objective_params_yaml(flood_weight, storm_forcings, stress_changes)
 
 
 def get_gages_from_hydrofabric(hydrofabric: Path) -> list[str]:
@@ -300,6 +335,7 @@ def create_calibration_config(
     q2_cfs: float | None = None,
     storm_depth: float | None = None,
     storm_concentration: float | None = None,
+    stress: tuple[float, float] | None = None,
 ) -> None:
     # first pass at this so I'm probably not using ngen-cal properly
     # for now keep it simple and only allow single gage lumped calibration
@@ -329,17 +365,21 @@ def create_calibration_config(
     copy_and_convert_paths_to_absolute(files.template_troute, files.calibration_troute)
 
     objective_params = ""
-    if objective != "kge":
+    if objective != "kge" or stress:
+        period = calibration_period(start, end, warmup_days, calib_ratio)
         objective_params = write_flood_objective_files(
             files,
             gage_id,
             observed,
-            calibration_period(start, end, warmup_days, calib_ratio),
+            period,
             objective,
             flood_weight,
             q2_cfs,
             storm_depth,
             storm_concentration,
+            stress,
+            # validation starts at the end of the calibration period
+            (period[1], end),
         )
 
     # create the dates for the ngen-cal config
@@ -463,6 +503,7 @@ def main():
             args.q2_cfs,
             args.storm_depth,
             args.storm_concentration,
+            stress_ends(args),
         )
 
     if args.run:
