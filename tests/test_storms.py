@@ -125,3 +125,60 @@ def test_each_stress_forcing_changes_the_storms_by_its_own_depth(tmp_path):
                 got = changed["precip_rate"][:, storm].sum("time").values
                 assert got == pytest.approx(depth * total, rel=1e-5)
                 assert changed["precip_rate"][:, outside].equals(a["precip_rate"][:, outside])
+
+
+def test_the_gini_index_is_zero_for_equal_hours_and_grows_as_one_hour_takes_more():
+    assert storms.gini(np.full(4, 2.0)) == pytest.approx(0.0)
+    assert storms.gini(np.array([0.0, 0.0, 0.0, 5.0])) == pytest.approx(0.75)
+    assert storms.gini(np.array([1.0, 2.0, 3.0])) < storms.gini(np.array([1.0, 2.0, 30.0]))
+
+
+def test_the_matching_exponent_recovers_the_power_a_storm_was_raised_to():
+    hourly = rain()[0, :100]
+    for exponent in (0.6, 1.0, 1.7):
+        target = storms.gini(hourly**exponent)
+        assert storms.matching_exponent(hourly, target) == pytest.approx(exponent, rel=1e-6)
+    assert np.isnan(storms.matching_exponent(hourly, 0.999))
+
+
+def departures(product: str, depths: list[float], exponents: list[float]) -> pd.DataFrame:
+    return pd.DataFrame({"product": product, "depth": depths, "exponent": exponents})
+
+
+def test_a_product_twice_the_forcing_departs_in_depth_alone_over_the_hours_it_holds():
+    r = rain()
+    storm_hours = storms.storm_steps(HOURS, [PEAK])
+    gappy = 3 * r
+    gappy[1, storm_hours[0][:5]] = np.nan
+    found = storms.storm_departures(r, {"twice": 2 * r, "gappy": gappy}, storm_hours, HOURS)
+    twice, held = found.set_index("product").loc["twice"], found.set_index("product").loc["gappy"]
+    assert twice["depth"] == pytest.approx(2.0)
+    assert twice["exponent"] == pytest.approx(1.0, rel=1e-6)
+    assert twice["hours"] == len(storm_hours[0])
+    assert held["hours"] == len(storm_hours[0]) - 5
+    assert held["depth"] == pytest.approx(3.0)
+    assert twice["storm_start"] == HOURS[storm_hours[0][0]]
+
+
+def test_d_and_g_are_the_mean_departure_of_the_product_that_departs_most_either_way():
+    found = pd.concat(
+        [
+            departures("a", [2.0, 0.5], [1.0, 1.0]),
+            departures("b", [1.5, 1.5], [1.2, 1 / 1.2]),
+            departures("c", [1.0, 1.0], [np.nan, 1.1]),
+        ]
+    )
+    assert storms.mean_departures(found) == pytest.approx((2.0, 1.2))
+
+
+def test_the_stress_tests_ends_are_the_largest_departure_at_any_storm_either_way():
+    found = pd.concat([departures("a", [2.0, 0.4], [1.0, 1.1]), departures("b", [1.5], [1 / 1.3])])
+    assert storms.largest_departures(found) == pytest.approx((2.5, 1.3))
+
+
+def test_departures_with_no_storm_are_refused():
+    empty = departures("a", [], [])
+    with pytest.raises(ValueError, match="no product"):
+        storms.mean_departures(empty)
+    with pytest.raises(ValueError, match="no product"):
+        storms.largest_departures(empty)

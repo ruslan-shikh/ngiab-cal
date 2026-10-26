@@ -122,6 +122,10 @@ class FilePaths:
         return self.calibration_folder / "storm_wet.nc"
 
     @property
+    def storm_error(self) -> Path:
+        return self.calibration_folder / "storm_error.csv"
+
+    @property
     def stress_folder(self) -> Path:
         return self.calibration_folder / "stress"
 

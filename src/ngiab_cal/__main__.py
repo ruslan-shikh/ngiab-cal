@@ -240,6 +240,22 @@ def objective_params_yaml(
     return text
 
 
+def record_floods(
+    files: FilePaths, gage_id: str, observed: pd.DataFrame, q2_cfs: float | None
+) -> tuple[pd.DataFrame, float]:
+    """Every scored flood of the observed record, and the 2-year flood in ft3/s it is read above"""
+    if q2_cfs is None:
+        logging.info(f"Downloading the annual peaks of {gage_id}")
+        q2_cfs = floods.two_year_flood_cfs(floods.download_annual_peaks(gage_id))
+        logging.info(f"2-year flood {q2_cfs:.0f} ft3/s, the median of the annual peaks")
+    area_mi2 = gage_drainage_area_km2(files.geopackage_path, gage_id) / floods.KM2_PER_MI2
+    flow = observed.set_index("value_date")
+    found = floods.find_floods(
+        flow["obs_flow"], flow["estimated"], q2_cfs * floods.CMS_PER_CFS, area_mi2
+    )
+    return found, q2_cfs
+
+
 def write_flood_objective_files(
     files: FilePaths,
     gage_id: str,
@@ -256,15 +272,7 @@ def write_flood_objective_files(
     """Write the flood list, the robust objectives' drier and wetter forcings, and with ``stress``,
     the stress test's d and g, its changed forcings of the floods of ``validation_period``;
     returns the config's objective_params block"""
-    if q2_cfs is None:
-        logging.info(f"Downloading the annual peaks of {gage_id}")
-        q2_cfs = floods.two_year_flood_cfs(floods.download_annual_peaks(gage_id))
-        logging.info(f"2-year flood {q2_cfs:.0f} ft3/s, the median of the annual peaks")
-    area_mi2 = gage_drainage_area_km2(files.geopackage_path, gage_id) / floods.KM2_PER_MI2
-    flow = observed.set_index("value_date")
-    found = floods.find_floods(
-        flow["obs_flow"], flow["estimated"], q2_cfs * floods.CMS_PER_CFS, area_mi2
-    )
+    found, q2_cfs = record_floods(files, gage_id, observed, q2_cfs)
     peaks = found["peak_time"]
     in_period = found[(peaks >= period[0]) & (peaks <= period[1])]
     if objective != "kge" and in_period.empty:
@@ -308,6 +316,83 @@ def write_flood_objective_files(
         changes.to_csv(files.stress_changes, index=False)
         stress_changes = container_path(files, files.stress_changes)
     return objective_params_yaml(flood_weight, storm_forcings, stress_changes)
+
+
+def estimate_storm_error(
+    data_folder: Path,
+    gage_id: str,
+    warmup_days: int,
+    calib_ratio: float,
+    q2_cfs: float | None,
+) -> None:
+    """Write how far the MRMS products depart from the forcing at the calibration floods' storms
+    to calibration/storm_error.csv, and log the settings it gives"""
+    try:
+        from ngiab_cal import storm_error
+    except ImportError as error:
+        raise SystemExit(
+            f"--storm-error needs the storms extra: pip install 'ngiab-cal[storms]' ({error})"
+        )
+    files = FilePaths(data_folder)
+    files.calibration_folder.mkdir(exist_ok=True)
+    if not gage_id:
+        gage_id = pick_gage_to_calibrate(files.geopackage_path)
+    start, end = get_start_end_times(files.template_realization)
+    observed = write_usgs_data_to_csv(start, end, gage_id, files.observed_discharge)
+    found, q2_cfs = record_floods(files, gage_id, observed, q2_cfs)
+    period = calibration_period(start, end, warmup_days, calib_ratio)
+    peaks = found["peak_time"][
+        (found["peak_time"] >= period[0]) & (found["peak_time"] <= period[1])
+    ]
+    if peaks.empty:
+        raise ValueError(
+            f"No flood above the 2-year flood ({q2_cfs:.0f} ft3/s) is scored in the calibration "
+            f"period {period[0]} to {period[1]}, so there is no storm to compare the forcing at"
+        )
+    logging.info(f"Comparing the forcing with MRMS at the storms of {len(peaks)} floods")
+    departures = storm_error.storm_error(netcdf_forcing(files), files.geopackage_path, peaks)
+    departures.to_csv(files.storm_error, index=False, date_format=TIME_FORMAT)
+    held = departures.groupby("product").size()
+    logging.info(
+        "Storms each product departs at: " + ", ".join(f"{p} {n}" for p, n in held.items())
+    )
+    settings = storm_settings(departures)
+    logging.info(
+        f"Wrote {files.storm_error}; the robust objectives and --stress-test take from it "
+        + " ".join(f"--{k.replace('_', '-')} {v:.2f}" for k, v in settings.items())
+    )
+
+
+def storm_settings(departures: pd.DataFrame) -> dict[str, float]:
+    """d and g of the robust objectives, and the stress test's ends, from the departures"""
+    d, g = storms.mean_departures(departures)
+    depth, concentration = storms.largest_departures(departures)
+    return {
+        "storm_depth": d,
+        "storm_concentration": g,
+        "stress_depth": depth,
+        "stress_concentration": concentration,
+    }
+
+
+def fill_storm_settings(args, files: FilePaths) -> None:
+    """Take d and g, and the stress test's ends, from calibration/storm_error.csv wherever the
+    options leave them out and the objective or the stress test needs them"""
+    robust = args.objective in ROBUST_OBJECTIVES
+    if not (robust or args.stress_test) or not files.storm_error.exists():
+        return
+    settings = storm_settings(pd.read_csv(files.storm_error))
+    names = ("storm_depth", "storm_concentration") if robust else ()
+    if args.stress_test:
+        names += ("stress_depth", "stress_concentration")
+    filled = [name for name in names if getattr(args, name) is None]
+    for name in filled:
+        setattr(args, name, settings[name])
+    if filled:
+        logging.info(
+            f"From {files.storm_error}: "
+            + " ".join(f"--{k.replace('_', '-')} {settings[k]:.2f}" for k in filled)
+        )
 
 
 def get_gages_from_hydrofabric(hydrofabric: Path) -> list[str]:
@@ -456,11 +541,19 @@ def main():
     setup_logging()
     parser = get_arg_parser()
     args = parser.parse_args()
-    check_objective_arguments(parser, args)
-
     if args.debug:
         set_log_level(logging.DEBUG)
     paths = FilePaths(args.data_folder)
+    # drop the gage- syntax used in other tools
+    if args.gage:
+        args.gage = args.gage.split("-")[-1]
+    if args.storm_error:
+        estimate_storm_error(
+            args.data_folder, args.gage, args.warmup, args.calibration_ratio, args.q2_cfs
+        )
+        return
+    fill_storm_settings(args, paths)
+    check_objective_arguments(parser, args)
 
     data_folder_valid = validate_run_files(paths, log_level=logging.ERROR)
 
@@ -488,9 +581,6 @@ def main():
                 logging.info("Calibration run cancelled")
                 return
 
-    # drop the gage- syntax used in other tools
-    if args.gage:
-        args.gage = args.gage.split("-")[-1]
     if not config_valid or args.force:
         create_calibration_config(
             args.data_folder,

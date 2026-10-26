@@ -242,3 +242,81 @@ def test_the_stress_test_takes_its_own_ends_or_else_the_robust_objectives():
     check_objective_arguments(parser, args)
     assert stress_ends(args) == (2.0, 1.1)
     assert stress_ends(parser.parse_args(["folder"])) is None
+
+
+def storm_error_file(files: FilePaths) -> None:
+    pd.DataFrame(
+        {
+            "product": ["GaugeCorr_QPE_01H", "GaugeCorr_QPE_01H", "RadarOnly_QPE_01H"],
+            "depth": [2.0, 0.5, 1.5],
+            "exponent": [1.1, 1.1, 1 / 1.4],
+        }
+    ).to_csv(files.storm_error, index=False)
+
+
+def test_a_robust_objective_and_the_stress_test_read_the_storm_error_file(tmp_path):
+    files = package(tmp_path)
+    storm_error_file(files)
+    parser = get_arg_parser()
+    args = parser.parse_args(["folder", "--objective", "kge-robust", "--stress-test"])
+    cli.fill_storm_settings(args, files)
+    check_objective_arguments(parser, args)
+    assert (args.storm_depth, args.storm_concentration) == pytest.approx((2.0, 1.4))
+    assert stress_ends(args) == pytest.approx((2.0, 1.4))
+
+
+def test_numbers_given_override_the_storm_error_file(tmp_path):
+    files = package(tmp_path)
+    storm_error_file(files)
+    parser = get_arg_parser()
+    argv = ["folder", "--objective", "kge-flood-robust", "--storm-depth", "1.3", "--stress-test"]
+    args = parser.parse_args([*argv, "--stress-concentration", "1.2"])
+    cli.fill_storm_settings(args, files)
+    assert (args.storm_depth, args.storm_concentration) == pytest.approx((1.3, 1.4))
+    assert stress_ends(args) == pytest.approx((2.0, 1.2))
+
+
+def test_an_objective_that_changes_no_storm_ignores_the_storm_error_file(tmp_path):
+    files = package(tmp_path)
+    storm_error_file(files)
+    parser = get_arg_parser()
+    args = parser.parse_args(["folder", "--objective", "kge-flood-mean"])
+    cli.fill_storm_settings(args, files)
+    check_objective_arguments(parser, args)
+    assert args.storm_depth is None and stress_ends(args) is None
+
+
+def test_storm_error_compares_at_the_calibration_floods_storms_alone(tmp_path, monkeypatch):
+    from ngiab_cal import storm_error
+
+    files = package(tmp_path)
+    compared = {}
+
+    def departures(forcing_file, geopackage, peaks):
+        compared["peaks"] = list(peaks)
+        return pd.DataFrame(
+            {
+                "product": ["RadarOnly_QPE_01H"],
+                "storm_start": [pd.Timestamp("2020-01-11 12:00")],
+                "storm_end": [pd.Timestamp("2020-01-25 12:00")],
+                "hours": [337],
+                "depth": [1.5],
+                "exponent": [1.2],
+            }
+        )
+
+    monkeypatch.setattr(cli, "get_start_end_times", lambda path: (START, END))
+    monkeypatch.setattr(cli, "write_usgs_data_to_csv", lambda *args: observed())
+    monkeypatch.setattr(storm_error, "storm_error", departures)
+    cli.estimate_storm_error(tmp_path, "01234567", 10, 0.4, 353.0)
+    assert compared["peaks"] == [pd.Timestamp("2020-01-18 12:00")]
+    written = pd.read_csv(files.storm_error)
+    assert written["storm_start"].tolist() == ["2020-01-11 12:00:00"]
+    assert cli.storm_settings(written) == pytest.approx(
+        {
+            "storm_depth": 1.5,
+            "storm_concentration": 1.2,
+            "stress_depth": 1.5,
+            "stress_concentration": 1.2,
+        }
+    )

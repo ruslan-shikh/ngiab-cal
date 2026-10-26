@@ -11,6 +11,7 @@ A Python CLI tool to simplify hydrologic model calibration for NextGen In A Box 
 - [Calibration Process](#calibration-process)
 - [Calibrating for Floods](#calibrating-for-floods)
 - [Stress Testing a Calibration](#stress-testing-a-calibration)
+- [Measuring the Storm Error](#measuring-the-storm-error)
 - [Calibration Configuration File](#calibration-configuration-file)
 - [Example: Calibrating CAMELS Basins](#example-calibrating-camels-basins)
 - [How It Works](#how-it-works)
@@ -79,9 +80,10 @@ ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID -f
 usage: ngiab-cal [-h] [-g GAGE] [-f] [--run] [-i ITERATIONS] [--debug] [-w WARMUP]
                  [--calibration_ratio CALIBRATION_RATIO]
                  [--objective {kge,kge-flood-mean,kge-flood-robust,kge-robust}]
-                 [--flood-weight FLOOD_WEIGHT] [--q2-cfs Q2_CFS] [--storm-depth STORM_DEPTH]
-                 [--storm-concentration STORM_CONCENTRATION] [--stress-test]
-                 [--stress-depth STRESS_DEPTH] [--stress-concentration STRESS_CONCENTRATION]
+                 [--flood-weight FLOOD_WEIGHT] [--q2-cfs Q2_CFS] [--storm-error]
+                 [--storm-depth STORM_DEPTH] [--storm-concentration STORM_CONCENTRATION]
+                 [--stress-test] [--stress-depth STRESS_DEPTH]
+                 [--stress-concentration STRESS_CONCENTRATION]
                  data_folder
 
 Create a calibration config for ngen-cal
@@ -121,23 +123,30 @@ options:
                         The weight w of the flood term, from 0 to 1
   --q2-cfs Q2_CFS       The gage's 2-year flood in ft3/s, e.g. a Bulletin 17C estimate from PeakFQ.
                         Default: the median of the gage's annual peaks from USGS
+  --storm-error         Instead of writing a config, compare the forcing's rain with three MRMS
+                        precipitation products at the storms of the calibration floods, and write
+                        calibration/storm_error.csv. The robust objectives and --stress-test then take
+                        d, g and the stress test's ends from it. Needs pip install 'ngiab-cal[storms]'
   --storm-depth STORM_DEPTH
-                        Required by the robust objectives. d >= 1: the drier forcing scales the
-                        calibration floods' storms to 1/d of their depth, the wetter one to d times
+                        d >= 1 of the robust objectives: the drier forcing scales the calibration
+                        floods' storms to 1/d of their depth, the wetter one to d times.
+                        Default: the mean depth departure in calibration/storm_error.csv
   --storm-concentration STORM_CONCENTRATION
-                        Required by the robust objectives. g >= 1: the drier forcing raises the
-                        storms' hourly rain to 1/g, spreading it out, the wetter one to g, packing it
-                        into the heavier hours; each storm's total is kept before the depth change
+                        g >= 1 of the robust objectives: the drier forcing raises the storms' hourly
+                        rain to 1/g, spreading it out, the wetter one to g, packing it into the heavier
+                        hours; each storm's total is kept before the depth change.
+                        Default: the mean concentration departure in calibration/storm_error.csv
   --stress-test         After calibrating, rerun the best parameters with the storms of the validation
                         period's floods changed, and report each flood's peak error under every change.
                         Depth runs in ten equal steps of ln f to 1/d and to d; concentration takes 1/g
                         and g, alone and with each end of depth: 26 runs beside the unchanged one.
                         The calibration itself is unchanged
   --stress-depth STRESS_DEPTH
-                        d >= 1, the stress test's largest change of depth. Default: --storm-depth
+                        d >= 1, the stress test's largest change of depth. Default: the largest
+                        depth departure in calibration/storm_error.csv, else --storm-depth
   --stress-concentration STRESS_CONCENTRATION
-                        g >= 1, the stress test's largest change of concentration.
-                        Default: --storm-concentration
+                        g >= 1, the stress test's largest change of concentration. Default: the largest
+                        concentration departure in calibration/storm_error.csv, else --storm-concentration
 ```
 
 ## Calibration Process
@@ -167,7 +176,7 @@ ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --objective kge-flood-robus
 
 ngiab-cal writes every flood of the record to `calibration/floods.csv`. ngen-cal scores the floods of the period it evaluates, so the validation metrics also carry the held-out floods' peak errors (`FLOOD_MEAN_PEAK_ERR`, `FLOOD_MAX_PEAK_ERR`). ngiab-cal stops if the calibration period has no flood.
 
-**Robust objectives.** The drier and wetter forcings change only the precipitation of the calibration period's floods' storms, the seven days either side of each peak: P' = f·s·P^γ, where s holds each catchment's storm total so that γ alone moves rain between hours. The drier forcing takes f = 1/d and γ = 1/g, spreading each storm out; the wetter one f = d and γ = g, packing its rain into the heaviest hours. d and g say how far the forcing's storms may be off in depth and in concentration; at three basins where AORC was compared with the MRMS precipitation products at the calibration storms, d was 1.2 to 1.6 and g 1.1 to 1.3. ngiab-cal writes the two forcings to `calibration/storm_dry.nc` and `calibration/storm_wet.nc`; the realization's forcing must be NetCDF, as the NGIAB preprocessor writes it.
+**Robust objectives.** The drier and wetter forcings change only the precipitation of the calibration period's floods' storms, the seven days either side of each peak: P' = f·s·P^γ, where s holds each catchment's storm total so that γ alone moves rain between hours. The drier forcing takes f = 1/d and γ = 1/g, spreading each storm out; the wetter one f = d and γ = g, packing its rain into the heaviest hours. d and g say how far the forcing's storms may be off in depth and in concentration, and `--storm-error` measures them for the package (see [Measuring the Storm Error](#measuring-the-storm-error)); at three basins where AORC was compared with the MRMS precipitation products at the calibration storms, d was 1.2 to 1.6 and g 1.1 to 1.3. ngiab-cal writes the two forcings to `calibration/storm_dry.nc` and `calibration/storm_wet.nc`; the realization's forcing must be NetCDF, as the NGIAB preprocessor writes it.
 
 Every iteration of a robust objective runs the model three times at once, each run in its own directory, so it needs up to three times the cores, or up to three times the time, of a KGE iteration, and three times the shared memory. At a basin of 13 catchments over ten years on 6 cores, the first evaluation took 2 min 52 s against 1 min 51 s for KGE alone.
 
@@ -179,7 +188,7 @@ Every iteration of a robust objective runs the model three times at once, each r
 ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --objective kge-flood-mean --stress-test --stress-depth 2.2 --stress-concentration 1.5
 ```
 
-**The changes.** P' = f·s·P^γ as above, over the seven days either side of each validation flood's peak. Depth runs in ten equal steps of ln f from 1/d to d with γ = 1, the grid of Yang et al. (2026, arXiv:2602.05237, Fig. 7); concentration takes γ = 1/g and γ = g, at f = 1 and at each end of depth. That is 26 changed runs beside the unchanged one; a change that repeats another is left out, so g = 1 leaves the 20 of depth. d and g are the largest errors to test, and default to `--storm-depth` and `--storm-concentration`. A robust calibration trains at how far the storms are typically off and is tested at how far they can be, so the stress test's own values are often the larger: at seven basins where AORC was compared with the MRMS precipitation products at the calibration storms, the largest departures were 1.4 to 2.2 in depth and 1.2 to 1.7 in concentration.
+**The changes.** P' = f·s·P^γ as above, over the seven days either side of each validation flood's peak. Depth runs in ten equal steps of ln f from 1/d to d with γ = 1, the grid of Yang et al. (2026, arXiv:2602.05237, Fig. 7); concentration takes γ = 1/g and γ = g, at f = 1 and at each end of depth. That is 26 changed runs beside the unchanged one; a change that repeats another is left out, so g = 1 leaves the 20 of depth. d and g are the largest errors to test, and default to the largest departures `--storm-error` measured, else to `--storm-depth` and `--storm-concentration`. A robust calibration trains at how far the storms are typically off and is tested at how far they can be, so the stress test's own values are often the larger: at seven basins where AORC was compared with the MRMS precipitation products at the calibration storms, the largest departures were 1.4 to 2.2 in depth and 1.2 to 1.7 in concentration.
 
 **The report.** Beside the validation metrics in `calibration/Output/Validation_Run`:
 
@@ -192,6 +201,22 @@ ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --objective kge-flood-mean 
 A response of 1 means the simulated peak scales with the storm's depth; above 1, it grows faster than the rain. Q̂ is the largest simulated flow within seven days of the observed peak, so a `timing_h` of days rather than hours says the window's largest flow is not this storm's response: the model missed the flood, or the storm was cut until another event's flow or an earlier recession is larger. Change k is row k of `calibration/stress/changes.csv`, which lists each change's f, γ and forcing.
 
 **Cost.** ngiab-cal writes the 26 forcings to `calibration/stress/` before the calibration starts, each a full copy of the package's forcing, so about 26 times its size on disk; they can be deleted once the validation has run. The validation runs them three at a time, as a robust iteration runs its three, so the stress test needs no more cores than a robust calibration and adds about nine of its iterations' time to the validation. ngiab-cal stops if the validation period has no flood, and the realization's forcing must be NetCDF.
+
+## Measuring the Storm Error
+
+`--storm-error` measures how far the forcing's storms are off, instead of writing a config: it compares the forcing's rain at the calibration period's floods' storms with the MRMS precipitation products and writes `calibration/storm_error.csv`. The robust objectives and `--stress-test` then take d, g and the stress test's ends from that file, saying so in the log, and a number given on the command line overrides it:
+
+```bash
+pip install 'ngiab-cal[storms]'
+ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --storm-error
+ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --objective kge-flood-robust --stress-test
+```
+
+**The products.** MRMS's 1-hour precipitation estimates, read for each storm hour from the Iowa Environmental Mesonet's archive (mtarchive.geol.iastate.edu): the radar-only estimate, and the gauge-corrected one, GaugeCorr before MRMS v12.0 of October 2020 and MultiSensor Pass 2 after it. Each hour is averaged over each catchment as the NGIAB preprocessor averages its forcing, every cell weighted by the fraction of it the catchment's divide covers, and labelled with the hour its accumulation ends, as AORC's hours are. An hour the archive does not hold is left out, and nothing is kept on disk.
+
+**The departures.** At each storm, a product's depth departure is its storm total over the forcing's, over the hours it holds at every catchment; its concentration departure is the exponent γ that gives the forcing's hourly rain, pooled over the catchments, the product's Gini index, so it reads as the γ of P' = f·s·P^γ. d and g are the mean departure of the product that departs most, its mean |ln| over the storms: how far the storms are typically off, which the robust objectives train at. The stress test's ends are the largest departure at any storm, taken either way, so a storm at half the forcing's depth counts as 2. `calibration/storm_error.csv` holds one row per product and storm: `product`, `storm_start`, `storm_end`, `hours`, `depth`, `exponent`.
+
+**Cost.** Each storm hour is a file of about 0.8 MB per product, fetched and decoded four at a time. At a basin of 13 catchments whose calibration floods make four storms, `--storm-error` read 3,332 hours, about 2.7 GB, in 32 minutes, most of it fetching and decoding the files, so the time follows the storms' hours more than the catchments. ngiab-cal stops if the calibration period has no flood, or if no product holds an hour of its storms.
 
 ## Example: Calibrating CAMELS Basins
 

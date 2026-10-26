@@ -141,3 +141,84 @@ def write_stress_forcings(
     names = [f"stress_{k:02d}.nc" for k in range(1, len(changes) + 1)]
     write_changed_forcings(forcing_file, peaks, changes, [folder / name for name in names])
     return pd.DataFrame(changes, columns=["depth", "concentration"]).assign(forcing=names)
+
+
+# The exponent search looks between a thousandth and a thousand, a bracket for the bisection and
+# not a bound on the result: a Gini index no exponent in it gives is left unmatched.
+LOG_EXPONENT_BRACKET = float(np.log(1000.0))
+
+
+def gini(values: np.ndarray) -> float:
+    """The Gini index of ``values``: 0 when all are equal, 1 − 1/n when one holds everything."""
+    x = np.sort(np.asarray(values, dtype=float))
+    n = x.size
+    return float((2 * np.arange(1, n + 1) - n - 1) @ x / (n * x.sum()))
+
+
+def matching_exponent(hourly: np.ndarray, target: float) -> float:
+    """The exponent that gives ``hourly`` the Gini index ``target``, by bisection, since the index
+    grows with the exponent; NaN where no exponent in the bracket gives it."""
+    x = hourly / hourly.max()
+    lo, hi = -LOG_EXPONENT_BRACKET, LOG_EXPONENT_BRACKET
+    if not gini(x ** np.exp(lo)) <= target <= gini(x ** np.exp(hi)):
+        return float("nan")
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if gini(x ** np.exp(mid)) < target else (lo, mid)
+    return float(np.exp((lo + hi) / 2))
+
+
+def storm_departures(
+    rain: np.ndarray,
+    products: dict[str, np.ndarray],
+    storms: list[np.ndarray],
+    hours: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """How far each product departs from ``rain`` at each storm it holds an hour of and both rain
+    in: its depth ratio, and the exponent that gives the storm of ``rain`` the product's Gini
+    index of hourly rain, both over the hours the product holds at every catchment, with the rain
+    pooled over the catchments. ``rain`` and each product are catchments × ``hours``, in the same
+    units, a product NaN wherever it holds nothing."""
+    rows = []
+    for name, other in products.items():
+        for storm in storms:
+            held = np.isfinite(other[:, storm]).all(axis=0)
+            a, x = rain[:, storm][:, held], other[:, storm][:, held]
+            if a.sum() > 0 and x.sum() > 0:
+                rows.append(
+                    {
+                        "product": name,
+                        "storm_start": hours[storm[0]],
+                        "storm_end": hours[storm[-1]],
+                        "hours": int(held.sum()),
+                        "depth": float(x.sum() / a.sum()),
+                        "exponent": matching_exponent(a.mean(axis=0), gini(x.mean(axis=0))),
+                    }
+                )
+    columns = ["product", "storm_start", "storm_end", "hours", "depth", "exponent"]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _largest_mean(departures: pd.DataFrame, column: str) -> float:
+    """The largest of the products' mean |ln| of ``column``, as a factor of 1 or more."""
+    logs = np.abs(np.log(departures[column])).groupby(departures["product"]).mean().dropna()
+    if logs.empty:
+        raise ValueError("no product departs at any storm, so there is nothing to size from")
+    return float(np.exp(logs.max()))
+
+
+def mean_departures(departures: pd.DataFrame) -> tuple[float, float]:
+    """d and g of the robust objectives: the mean departure in depth and in concentration of the
+    product that departs most, each product's mean |ln| over its storms."""
+    return _largest_mean(departures, "depth"), _largest_mean(departures, "exponent")
+
+
+def largest_departures(departures: pd.DataFrame) -> tuple[float, float]:
+    """The stress test's ends: the largest departure in depth and in concentration at any storm,
+    taken either way, so 0.5 counts as 2."""
+    if departures.empty or departures["exponent"].isna().all():
+        raise ValueError("no product departs at any storm, so there is nothing to size from")
+    return (
+        float(np.exp(np.abs(np.log(departures["depth"])).max())),
+        float(np.exp(np.abs(np.log(departures["exponent"])).max())),
+    )

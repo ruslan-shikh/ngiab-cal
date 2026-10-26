@@ -32,6 +32,14 @@ ngiab-cal = "ngiab_cal.__main__:main"
 Homepage = "https://github.com/CIROH-UA/ngiab-cal"
 Issues = "https://github.com/CIROH-UA/ngiab-cal/issues"
 
+[project.optional-dependencies]
+storms = [
+    "exactextract>=0.2",
+    "geopandas>=1.0",
+    "pygrib>=2.1.5",
+    "pyproj>=3.6",
+]
+
 
 [dependency-groups]
 dev = [

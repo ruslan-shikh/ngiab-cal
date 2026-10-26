@@ -89,17 +89,27 @@ def get_arg_parser() -> ArgumentParser:
         "Default: the median of the gage's annual peaks from USGS\n\n",
     )
     parser.add_argument(
+        "--storm-error",
+        action="store_true",
+        help="Instead of writing a config, compare the forcing's rain with three MRMS\n"
+        "precipitation products at the storms of the calibration floods, and write\n"
+        "calibration/storm_error.csv. The robust objectives and --stress-test then take\n"
+        "d, g and the stress test's ends from it. Needs pip install 'ngiab-cal[storms]'\n\n",
+    )
+    parser.add_argument(
         "--storm-depth",
         type=float,
-        help="Required by the robust objectives. d >= 1: the drier forcing scales the\n"
-        "calibration floods' storms to 1/d of their depth, the wetter one to d times\n\n",
+        help="d >= 1 of the robust objectives: the drier forcing scales the calibration\n"
+        "floods' storms to 1/d of their depth, the wetter one to d times.\n"
+        "Default: the mean depth departure in calibration/storm_error.csv\n\n",
     )
     parser.add_argument(
         "--storm-concentration",
         type=float,
-        help="Required by the robust objectives. g >= 1: the drier forcing raises the\n"
-        "storms' hourly rain to 1/g, spreading it out, the wetter one to g, packing it\n"
-        "into the heavier hours; each storm's total is kept before the depth change\n\n",
+        help="g >= 1 of the robust objectives: the drier forcing raises the storms' hourly\n"
+        "rain to 1/g, spreading it out, the wetter one to g, packing it into the heavier\n"
+        "hours; each storm's total is kept before the depth change.\n"
+        "Default: the mean concentration departure in calibration/storm_error.csv\n\n",
     )
     parser.add_argument(
         "--stress-test",
@@ -113,13 +123,14 @@ def get_arg_parser() -> ArgumentParser:
     parser.add_argument(
         "--stress-depth",
         type=float,
-        help="d >= 1, the stress test's largest change of depth. Default: --storm-depth\n\n",
+        help="d >= 1, the stress test's largest change of depth. Default: the largest\n"
+        "depth departure in calibration/storm_error.csv, else --storm-depth\n\n",
     )
     parser.add_argument(
         "--stress-concentration",
         type=float,
-        help="g >= 1, the stress test's largest change of concentration.\n"
-        "Default: --storm-concentration\n\n",
+        help="g >= 1, the stress test's largest change of concentration. Default: the largest\n"
+        "concentration departure in calibration/storm_error.csv, else --storm-concentration\n\n",
     )
 
     return parser
@@ -143,7 +154,10 @@ def check_objective_arguments(parser: ArgumentParser, args: Namespace) -> None:
     robust = args.objective in ROBUST_OBJECTIVES
     storm = (args.storm_depth, args.storm_concentration)
     if robust and None in storm:
-        parser.error(f"{args.objective} needs --storm-depth and --storm-concentration")
+        parser.error(
+            f"{args.objective} needs --storm-depth and --storm-concentration, or the "
+            "calibration/storm_error.csv --storm-error writes"
+        )
     if not robust and storm != (None, None):
         parser.error("--storm-depth and --storm-concentration apply to the robust objectives")
     if robust and min(storm) < 1:
@@ -158,8 +172,9 @@ def check_objective_arguments(parser: ArgumentParser, args: Namespace) -> None:
     if ends is not None:
         if None in ends:
             parser.error(
-                "--stress-test needs --stress-depth and --stress-concentration, or a robust "
-                "objective's --storm-depth and --storm-concentration"
+                "--stress-test needs --stress-depth and --stress-concentration, the "
+                "calibration/storm_error.csv --storm-error writes, or a robust objective's "
+                "--storm-depth and --storm-concentration"
             )
         if min(ends) < 1:
             parser.error("--stress-depth and --stress-concentration are 1 or more")
