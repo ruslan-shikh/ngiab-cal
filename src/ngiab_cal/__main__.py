@@ -12,10 +12,13 @@ from aiohttp.client_exceptions import ContentTypeError
 from hydrotools.nwis_client import IVDataService
 from rich.prompt import Prompt
 
+from ngiab_cal import floods
 from ngiab_cal.arguments import (
     CALIBRATION_VALIDATION_RATIO,
+    FLOOD_WEIGHT_DEFAULT,
     ITERATIONS_DEFAULT,
     WARMUP_DEFAULT,
+    check_objective_arguments,
     get_arg_parser,
 )
 from ngiab_cal.custom_logging import set_log_level, setup_logging
@@ -23,6 +26,8 @@ from ngiab_cal.file_paths import FilePaths, validate_calibration_files, validate
 
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 DOCKER_IMAGE_NAME = "awiciroh/ngiab-cal:latest"
+# the calibration folder as the container sees it
+CONTAINER_CALIBRATION_FOLDER = "/ngen/ngen/data/calibration"
 
 
 # hide IVDataService warning so we can show our own
@@ -80,8 +85,11 @@ def get_start_end_times(realization_path: Path) -> tuple[datetime, datetime]:
     return start, end
 
 
-def write_usgs_data_to_csv(start: datetime, end: datetime, gage_id: str, output_file: Path) -> None:
-    """Downloads the usgs observed data to csv for a given gage and time range"""
+def write_usgs_data_to_csv(
+    start: datetime, end: datetime, gage_id: str, output_file: Path
+) -> pd.DataFrame:
+    """Downloads the usgs observed data to csv for a given gage and time range, and returns it
+    with an `estimated` column that is True where USGS marks the value as estimated"""
     logging.info(f"Downloading USGS data for {gage_id} between {start} and {end}")
     data = pd.DataFrame()
     try:
@@ -93,23 +101,20 @@ def write_usgs_data_to_csv(start: datetime, end: datetime, gage_id: str, output_
     if data.empty:
         raise ValueError(f"Unable to find usgs observation for {gage_id} between {start} and {end}")
 
-    data = data.filter(["value_time", "value"])
-    data.columns = ["value_date", "obs_flow"]
+    # qualifiers read like "['A', 'e']", where 'e' marks an estimated value
+    data["estimated"] = data["qualifiers"].astype(str).str.contains("'e'", regex=False)
+    data = data.filter(["value_time", "value", "estimated"])
+    data.columns = ["value_date", "obs_flow", "estimated"]
     data["obs_flow"] = data["obs_flow"].astype(float)
-    data["obs_flow"] = data["obs_flow"] * 0.028316847
-    data.to_csv(output_file, index=False)
+    data["obs_flow"] = data["obs_flow"] * floods.CMS_PER_CFS
+    data[["value_date", "obs_flow"]].to_csv(output_file, index=False)
+    return data
 
 
-def write_ngen_cal_config(
-    data_folder: FilePaths,
-    gage_id: str,
-    start: datetime,
-    end: datetime,
-    iterations: int,
-    warm_up: int,
-    calibration_ratio: float,
-) -> None:
-    logging.info("Writing ngiab-cal configuration")
+def calibration_period(
+    start: datetime, end: datetime, warm_up: int, calibration_ratio: float
+) -> tuple[datetime, datetime]:
+    """Return the start and end of the calibration period, which follows the warm-up."""
     total_range = abs(start - end)
     # warm up is half the range, capped at 365 days
     warm_up_period = timedelta(days=warm_up)
@@ -127,6 +132,24 @@ def write_ngen_cal_config(
         evaluation_end = end
     else:
         evaluation_end = evaluation_start + calibration_td
+    return evaluation_start, evaluation_end
+
+
+def write_ngen_cal_config(
+    data_folder: FilePaths,
+    gage_id: str,
+    start: datetime,
+    end: datetime,
+    iterations: int,
+    warm_up: int,
+    period: tuple[datetime, datetime],
+    objective: str = "kge",
+    flood_settings: str = "",
+) -> None:
+    logging.info("Writing ngiab-cal configuration")
+    total_range = abs(start - end)
+    evaluation_start, evaluation_end = period
+    calibration_days = (evaluation_end - evaluation_start).days
     # validation starts at the end of the evaluation period
     validation_start = evaluation_end
     validation_end = end
@@ -147,6 +170,8 @@ def write_ngen_cal_config(
 
     with open(FilePaths.template_ngiab_cal_conf, "r") as f:
         template = f.read()
+    if not flood_settings:  # keep the kge config exactly as before
+        template = template.replace("{flood_settings}\n", "")
 
     with open(data_folder.calibration_config, "w") as file:
         file.write(
@@ -163,8 +188,64 @@ def write_ngen_cal_config(
                 full_eval_start_time=start.strftime(TIME_FORMAT),
                 full_eval_end_time=end.strftime(TIME_FORMAT),
                 gage_id=gage_id,
+                objective=objective.replace("-", "_"),
+                flood_settings=flood_settings,
             )
         )
+
+
+def gage_drainage_area_km2(hydrofabric: Path, gage_id: str) -> float:
+    """Get the drainage area of the gage's flowpath from the hydrofabric."""
+    with sqlite3.connect(hydrofabric) as con:
+        sql_query = (
+            "SELECT f.tot_drainage_areasqkm FROM flowpaths f "
+            "JOIN 'flowpath-attributes' a ON a.id = f.id WHERE a.gage = ?"
+        )
+        return float(con.execute(sql_query, (gage_id,)).fetchone()[0])
+
+
+def write_flood_objective_files(
+    files: FilePaths,
+    gage_id: str,
+    observed: pd.DataFrame,
+    *,
+    period: tuple[datetime, datetime],
+    flood_weight: float,
+    q2_cfs: float | None,
+) -> str:
+    """Write calibration/floods.csv and return the lines that point ngen-cal at it."""
+    if q2_cfs is None:
+        logging.info(f"Downloading the annual peaks of {gage_id}")
+        times = observed["value_date"]
+        years = range(floods.water_year(times.min()), floods.water_year(times.max()) + 1)
+        q2_cfs = floods.two_year_flood_cfs(floods.download_annual_peaks(gage_id), years)
+        logging.info(f"2-year flood {q2_cfs:.0f} ft3/s, the median of the annual peaks")
+    area_mi2 = gage_drainage_area_km2(files.geopackage_path, gage_id) / floods.KM2_PER_MI2
+    flow = observed.set_index("value_date")
+    found = floods.find_floods(
+        flow["obs_flow"], flow["estimated"], q2_cfs * floods.CMS_PER_CFS, area_mi2
+    )
+    found.to_csv(files.floods, index=False, date_format=TIME_FORMAT)
+
+    peaks = found["peak_time"]
+    calibration_floods = found[(peaks >= period[0]) & (peaks <= period[1])]
+    if calibration_floods.empty:
+        raise ValueError(
+            f"No flood above the 2-year flood ({q2_cfs:.0f} ft3/s) peaks in the calibration "
+            f"period {period[0]} to {period[1]}, so kge-flood has nothing to calibrate on"
+        )
+    logging.info(
+        f"{len(calibration_floods)} floods in the calibration period, {len(found)} in the record"
+    )
+    if len(calibration_floods) < 3:
+        logging.warning(
+            "Fewer than 3 floods in the calibration period, so the flood term rests on very few "
+            "peaks; a longer calibration period would give it more"
+        )
+    return (
+        f"    floods: {CONTAINER_CALIBRATION_FOLDER}/{files.floods.name}\n"
+        f"    flood_weight: {flood_weight}"
+    )
 
 
 def get_gages_from_hydrofabric(hydrofabric: Path) -> list[str]:
@@ -187,6 +268,9 @@ def create_calibration_config(
     iterations: int = ITERATIONS_DEFAULT,
     warmup_days: int = WARMUP_DEFAULT,
     calib_ratio: float = CALIBRATION_VALIDATION_RATIO,
+    objective: str = "kge",
+    flood_weight: float = FLOOD_WEIGHT_DEFAULT,
+    q2_cfs: float | None = None,
 ) -> None:
     # first pass at this so I'm probably not using ngen-cal properly
     # for now keep it simple and only allow single gage lumped calibration
@@ -208,15 +292,37 @@ def create_calibration_config(
 
     start, end = get_start_end_times(files.template_realization)
 
-    write_usgs_data_to_csv(start, end, gage_id, files.observed_discharge)
+    observed = write_usgs_data_to_csv(start, end, gage_id, files.observed_discharge)
     create_crosswalk_json(files.geopackage_path, gage_id, files.crosswalk)
     # copy the ngen realization and troute config files into the calibration folder
     # convert the relative paths to absolute for ngiab_cal compatibility
     copy_and_convert_paths_to_absolute(files.template_realization, files.calibration_realization)
     copy_and_convert_paths_to_absolute(files.template_troute, files.calibration_troute)
 
+    period = calibration_period(start, end, warmup_days, calib_ratio)
+    flood_settings = ""
+    if objective != "kge":
+        flood_settings = write_flood_objective_files(
+            files,
+            gage_id,
+            observed,
+            period=period,
+            flood_weight=flood_weight,
+            q2_cfs=q2_cfs,
+        )
+
     # create the dates for the ngen-cal config
-    write_ngen_cal_config(files, gage_id, start, end, iterations, warmup_days, calib_ratio)
+    write_ngen_cal_config(
+        files,
+        gage_id,
+        start,
+        end,
+        iterations,
+        warmup_days,
+        period,
+        objective,
+        flood_settings,
+    )
 
 
 def print_run_command(folder_to_run: Path) -> None:
@@ -277,7 +383,9 @@ def copy_best_params(realization: Path, calibrated_realization: Path) -> None:
 
 def main():
     setup_logging()
-    args = get_arg_parser().parse_args()
+    parser = get_arg_parser()
+    args = parser.parse_args()
+    check_objective_arguments(parser, args)
 
     if args.debug:
         set_log_level(logging.DEBUG)
@@ -314,7 +422,14 @@ def main():
         args.gage = args.gage.split("-")[-1]
     if not config_valid or args.force:
         create_calibration_config(
-            args.data_folder, args.gage, args.iterations, args.warmup, args.calibration_ratio
+            args.data_folder,
+            args.gage,
+            iterations=args.iterations,
+            warmup_days=args.warmup,
+            calib_ratio=args.calibration_ratio,
+            objective=args.objective,
+            flood_weight=FLOOD_WEIGHT_DEFAULT if args.flood_weight is None else args.flood_weight,
+            q2_cfs=args.q2_cfs,
         )
 
     if args.run:

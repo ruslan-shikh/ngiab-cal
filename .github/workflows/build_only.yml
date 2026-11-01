@@ -24,4 +24,7 @@ jobs:
       - name: Build package
         run: |
           python -m build
+      - uses: astral-sh/setup-uv@v6
+      - name: Run tests
+        run: uv run pytest
 

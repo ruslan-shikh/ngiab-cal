@@ -96,7 +96,8 @@ model:
     CFE: *id001
     NoahOWP: *id002
   eval_params:
-    objective: kge
+    objective: {objective}
+{flood_settings}
     evaluation_start: "{evaluation_start}"
     evaluation_stop: "{evaluation_stop}"
     valid_start_time: "{valid_start_time}"

@@ -9,6 +9,7 @@ A Python CLI tool to simplify hydrologic model calibration for NextGen In A Box 
 - [Basic Usage](#basic-usage)
 - [Advanced Options](#advanced-options)
 - [Calibration Process](#calibration-process)
+- [Calibrating for Floods](#calibrating-for-floods)
 - [Calibration Configuration File](#calibration-configuration-file)
 - [Example: Calibrating CAMELS Basins](#example-calibrating-camels-basins)
 - [How It Works](#how-it-works)
@@ -74,8 +75,10 @@ ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID -f
 ## Advanced Options
 
 ```
-usage: ngiab-cal [-h] [-g GAGE] [-f] [--run] [-i ITERATIONS] [--debug] [-w WARMUP] [--calibration_ratio CALIBRATION_RATIO]
-                  data_folder
+usage: ngiab-cal [-h] [-g GAGE] [-f] [--run] [-i ITERATIONS] [--debug] [-w WARMUP]
+                 [--calibration_ratio CALIBRATION_RATIO] [--objective {kge,kge-flood}]
+                 [--flood-weight FLOOD_WEIGHT] [--q2-cfs Q2_CFS]
+                 data_folder
 
 Create a calibration config for ngen-cal
 
@@ -99,6 +102,21 @@ options:
                         Default:0.5
                         How to split time after warmup into calibration and validation.
                         1 == 100% calibration, 0 == 100% validation, 0.8 == 80% calibration 20% validation
+  --objective {kge,kge-flood}
+                        Default:kge
+                        What the calibration minimizes:
+                          kge        1 - KGE
+                          kge-flood  (1 - w)(1 - KGE) + w * the mean peak error of the calibration floods
+                        A flood is an independent peak above the 2-year flood. Its peak error is
+                        |sim - obs| / obs, where sim is the largest simulated flow within 7 days either
+                        side of the observed peak
+
+  --flood-weight FLOOD_WEIGHT
+                        Default:0.5
+                        The weight w of the flood term, from 0 to 1
+
+  --q2-cfs Q2_CFS       The gage's 2-year flood in ft3/s, e.g. a Bulletin 17C estimate from PeakFQ.
+                        Default: the median of the gage's annual peaks from USGS
 ```
 
 ## Calibration Process
@@ -111,6 +129,28 @@ Default calibration settings on a 5 year period
 |<- warmup ->|<-     calibration     ->|                         |
 |<-             warmup               ->|<-      validation     ->|
 ```
+
+## Calibrating for Floods
+
+A calibration on KGE alone tends to undershoot flood peaks. `--objective kge-flood` adds the error in the flood peaks to what the calibration minimizes:
+
+```
+(1 - w)(1 - KGE) + w * E
+```
+
+E is the mean peak error, |sim - obs| / obs, over the floods in the calibration period. obs is the observed peak and sim is the largest simulated flow within seven days either side of it. `--flood-weight` sets w (default 0.5).
+
+```bash
+ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --objective kge-flood
+```
+
+ngiab-cal finds the floods in the gage's hourly record and lists them in `calibration/floods.csv`. A flood is a peak above the gage's 2-year flood:
+
+- The 2-year flood is the median of the gage's USGS annual peaks. Historic peaks, daily means, dam failures and peaks affected by regulation or urbanization (USGS codes 7, 1, 3, 6 and C) are left out, and ngiab-cal warns if it uses peaks regulated to an unknown degree (code 5). You can give your own value, such as a Bulletin 17C estimate from PeakFQ, with `--q2-cfs`.
+- Two peaks are separate floods if they are at least 5 + ln(drainage area in mi²) days apart and the flow drops below 3/4 of the smaller peak between them. Otherwise only the larger one counts.
+- A flood is left out if its peak hour or the hour on either side is missing or estimated. Gages often lose data at their largest floods, so ngiab-cal logs each flood it leaves out.
+
+ngiab-cal stops with an error if the calibration period has no flood, and warns if it has fewer than three, since the flood term then rests on very few peaks.
 
 ## Example: Calibrating CAMELS Basins
 
@@ -185,6 +225,15 @@ eval_params:
   site_name: "USGS 01646500: "  # Label for plots
 ```
 
+`--objective kge-flood` sets:
+
+```yaml
+eval_params:
+  objective: kge_flood
+  floods: /ngen/ngen/data/calibration/floods.csv
+  flood_weight: 0.5
+```
+
 These time periods follow the calibration process diagram shown earlier, with separate periods for warmup, calibration, and validation.
 
 ## How It Works
@@ -212,7 +261,7 @@ ngiab-cal has several important limitations to be aware of:
 
 2. **Limited Model Support**: Only calibrates parameters for CFE (Conceptual Functional Equivalent) and NoahOWP-Modular hydrologic models. Other models in the NextGen framework are not currently supported.
 
-3. **Single-Gage Calibration**: Designed for calibrating single-basin models using one USGS streamgage. Multi-gage or multi-objective calibration is not supported.
+3. **Single-Gage Calibration**: Designed for calibrating single-basin models using one USGS streamgage. Multi-gage calibration is not supported, and the flood objective combines KGE and the flood peaks into one weighted score rather than a multi-objective search.
 
 4. **Custom ngen-cal Branch**: Uses a modified version of ngen-cal from the `ngiab_cal` branch, which differs from the main branch. Features from newer releases of ngen-cal may not be available.
 
