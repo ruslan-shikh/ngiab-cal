@@ -1,5 +1,6 @@
 import json
 import logging
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -12,11 +13,15 @@ from aiohttp.client_exceptions import ContentTypeError
 from hydrotools.nwis_client import IVDataService
 from rich.prompt import Prompt
 
-from ngiab_cal import floods
+from ngiab_cal import floods, storms
 from ngiab_cal.arguments import (
     CALIBRATION_VALIDATION_RATIO,
     FLOOD_WEIGHT_DEFAULT,
     ITERATIONS_DEFAULT,
+    STORM_CONCENTRATION_DEFAULT,
+    STORM_DEPTH_DEFAULT,
+    STRESS_CONCENTRATION_DEFAULT,
+    STRESS_DEPTH_DEFAULT,
     WARMUP_DEFAULT,
     check_objective_arguments,
     get_arg_parser,
@@ -204,16 +209,48 @@ def gage_drainage_area_km2(hydrofabric: Path, gage_id: str) -> float:
         return float(con.execute(sql_query, (gage_id,)).fetchone()[0])
 
 
+def netcdf_forcing(files: FilePaths) -> Path:
+    """Get the NetCDF forcing file the realization reads."""
+    with open(files.template_realization) as f:
+        forcing = json.load(f)["global"]["forcing"]
+    if forcing.get("provider") != "NetCDF":
+        raise ValueError(
+            f"The realization's forcing provider must be NetCDF to change its storms, not "
+            f"{forcing.get('provider')}"
+        )
+    return (files.data_folder / forcing["path"]).resolve()
+
+
+def floods_in(
+    found: pd.DataFrame, period: tuple[datetime, datetime], name: str, q2_cfs: float
+) -> pd.DataFrame:
+    """Return the floods that peak in the period, and raise if there are none."""
+    peaks = found["peak_time"]
+    floods_in_period = found[(peaks >= period[0]) & (peaks <= period[1])]
+    if floods_in_period.empty:
+        raise ValueError(
+            f"No flood above the 2-year flood ({q2_cfs:.0f} ft3/s) peaks in the {name} "
+            f"period {period[0]} to {period[1]}"
+        )
+    return floods_in_period
+
+
 def write_flood_objective_files(
     files: FilePaths,
     gage_id: str,
     observed: pd.DataFrame,
     *,
     period: tuple[datetime, datetime],
+    objective: str,
     flood_weight: float,
     q2_cfs: float | None,
+    storm_depth: float,
+    storm_concentration: float,
+    stress: tuple[float, float] | None = None,
+    validation_period: tuple[datetime, datetime] | None = None,
 ) -> str:
-    """Write calibration/floods.csv and return the lines that point ngen-cal at it."""
+    """Write calibration/floods.csv and any forcings with changed storms, and return the lines
+    that point ngen-cal at them."""
     if q2_cfs is None:
         logging.info(f"Downloading the annual peaks of {gage_id}")
         times = observed["value_date"]
@@ -227,25 +264,55 @@ def write_flood_objective_files(
     )
     found.to_csv(files.floods, index=False, date_format=TIME_FORMAT)
 
-    peaks = found["peak_time"]
-    calibration_floods = found[(peaks >= period[0]) & (peaks <= period[1])]
-    if calibration_floods.empty:
-        raise ValueError(
-            f"No flood above the 2-year flood ({q2_cfs:.0f} ft3/s) peaks in the calibration "
-            f"period {period[0]} to {period[1]}, so kge-flood has nothing to calibrate on"
+    if objective != "kge":
+        calibration_floods = floods_in(found, period, "calibration", q2_cfs)
+        logging.info(
+            f"{len(calibration_floods)} floods in the calibration period, {len(found)} in the record"
         )
-    logging.info(
-        f"{len(calibration_floods)} floods in the calibration period, {len(found)} in the record"
-    )
-    if len(calibration_floods) < 3:
-        logging.warning(
-            "Fewer than 3 floods in the calibration period, so the flood term rests on very few "
-            "peaks; a longer calibration period would give it more"
-        )
-    return (
+        if len(calibration_floods) < 3:
+            logging.warning(
+                "Fewer than 3 floods in the calibration period, so the flood term rests on very "
+                "few peaks; a longer calibration period would give it more"
+            )
+    settings = (
         f"    floods: {CONTAINER_CALIBRATION_FOLDER}/{files.floods.name}\n"
         f"    flood_weight: {flood_weight}"
     )
+    if objective == "kge-flood-robust":
+        forcing = netcdf_forcing(files)
+        logging.info(
+            f"Writing the drier and wetter forcings to {files.calibration_folder}, about "
+            f"{2 * forcing.stat().st_size / 1e9:.1f} GB"
+        )
+        storm_forcings = [files.drier_forcing, files.wetter_forcing]
+        storms.write_changed_forcings(
+            forcing,
+            calibration_floods["peak_time"],
+            [(1 / storm_depth, 1 / storm_concentration), (storm_depth, storm_concentration)],
+            storm_forcings,
+        )
+        settings += "\n    storm_forcings:"
+        for path in storm_forcings:
+            settings += f"\n      - {CONTAINER_CALIBRATION_FOLDER}/{path.name}"
+
+    if stress:
+        validation_floods = floods_in(found, validation_period, "validation", q2_cfs)
+        forcing = netcdf_forcing(files)
+        copies = len(storms.stress_changes(*stress))
+        logging.info(
+            f"Writing the stress test's {copies} forcings for {len(validation_floods)} floods to "
+            f"{files.stress_folder}, about {copies * forcing.stat().st_size / 1e9:.1f} GB"
+        )
+        shutil.rmtree(files.stress_folder, ignore_errors=True)
+        files.stress_folder.mkdir()
+        changes = storms.write_stress_forcings(
+            forcing, validation_floods["peak_time"], *stress, files.stress_folder
+        )
+        container_stress = f"{CONTAINER_CALIBRATION_FOLDER}/{files.stress_folder.name}"
+        changes["forcing"] = [f"{container_stress}/{name}" for name in changes["forcing"]]
+        changes.to_csv(files.stress_changes, index=False)
+        settings += f"\n    stress_test: {container_stress}/{files.stress_changes.name}"
+    return settings
 
 
 def get_gages_from_hydrofabric(hydrofabric: Path) -> list[str]:
@@ -271,6 +338,9 @@ def create_calibration_config(
     objective: str = "kge",
     flood_weight: float = FLOOD_WEIGHT_DEFAULT,
     q2_cfs: float | None = None,
+    storm_depth: float = STORM_DEPTH_DEFAULT,
+    storm_concentration: float = STORM_CONCENTRATION_DEFAULT,
+    stress: tuple[float, float] | None = None,
 ) -> None:
     # first pass at this so I'm probably not using ngen-cal properly
     # for now keep it simple and only allow single gage lumped calibration
@@ -300,15 +370,27 @@ def create_calibration_config(
     copy_and_convert_paths_to_absolute(files.template_troute, files.calibration_troute)
 
     period = calibration_period(start, end, warmup_days, calib_ratio)
+    # a rerun drops the forcings an earlier robust calibration or stress test wrote
+    if objective != "kge-flood-robust":
+        files.drier_forcing.unlink(missing_ok=True)
+        files.wetter_forcing.unlink(missing_ok=True)
+    if not stress:
+        shutil.rmtree(files.stress_folder, ignore_errors=True)
     flood_settings = ""
-    if objective != "kge":
+    if objective != "kge" or stress:
         flood_settings = write_flood_objective_files(
             files,
             gage_id,
             observed,
             period=period,
+            objective=objective,
             flood_weight=flood_weight,
             q2_cfs=q2_cfs,
+            storm_depth=storm_depth,
+            storm_concentration=storm_concentration,
+            stress=stress,
+            # validation starts at the end of the calibration period
+            validation_period=(period[1], end),
         )
 
     # create the dates for the ngen-cal config
@@ -386,6 +468,16 @@ def main():
     parser = get_arg_parser()
     args = parser.parse_args()
     check_objective_arguments(parser, args)
+    # these default to None so that check_objective_arguments can tell whether they were given
+    for name, default in {
+        "flood_weight": FLOOD_WEIGHT_DEFAULT,
+        "storm_depth": STORM_DEPTH_DEFAULT,
+        "storm_concentration": STORM_CONCENTRATION_DEFAULT,
+        "stress_depth": STRESS_DEPTH_DEFAULT,
+        "stress_concentration": STRESS_CONCENTRATION_DEFAULT,
+    }.items():
+        if getattr(args, name) is None:
+            setattr(args, name, default)
 
     if args.debug:
         set_log_level(logging.DEBUG)
@@ -428,8 +520,11 @@ def main():
             warmup_days=args.warmup,
             calib_ratio=args.calibration_ratio,
             objective=args.objective,
-            flood_weight=FLOOD_WEIGHT_DEFAULT if args.flood_weight is None else args.flood_weight,
+            flood_weight=args.flood_weight,
             q2_cfs=args.q2_cfs,
+            storm_depth=args.storm_depth,
+            storm_concentration=args.storm_concentration,
+            stress=(args.stress_depth, args.stress_concentration) if args.stress_test else None,
         )
 
     if args.run:

@@ -1,4 +1,4 @@
-"""Find the floods that the kge-flood objective scores.
+"""Find the floods that the kge-flood and kge-flood-robust objectives use.
 
 A flood is a peak of the gage's hourly flow above its 2-year flood (Alam et al. 2026, JAWRA
 62(1) e70093). Two peaks count as separate floods when they are at least 5 + ln(drainage area in

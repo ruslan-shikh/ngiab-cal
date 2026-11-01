@@ -1,3 +1,4 @@
+import csv
 import glob
 import logging
 from pathlib import Path
@@ -114,6 +115,22 @@ class FilePaths:
         return self.calibration_folder / "floods.csv"
 
     @property
+    def drier_forcing(self) -> Path:
+        return self.calibration_folder / "storm_dry.nc"
+
+    @property
+    def wetter_forcing(self) -> Path:
+        return self.calibration_folder / "storm_wet.nc"
+
+    @property
+    def stress_folder(self) -> Path:
+        return self.calibration_folder / "stress"
+
+    @property
+    def stress_changes(self) -> Path:
+        return self.stress_folder / "changes.csv"
+
+    @property
     def calibrated_realization(self) -> Path:
         return self.calibration_folder / "Output" / "Validation_Run" / "realization.json"
 
@@ -137,4 +154,14 @@ def validate_calibration_files(self, log_level: int = logging.WARN) -> bool:
         self.crosswalk,
         self.observed_discharge,
     ]
+    # the changed forcings the config reads
+    config = self.calibration_config.read_text() if self.calibration_config.exists() else ""
+    if "storm_forcings:" in config:
+        required_calibration_files += [self.drier_forcing, self.wetter_forcing]
+    if "stress_test:" in config:
+        required_calibration_files.append(self.stress_changes)
+        if self.stress_changes.exists():
+            with open(self.stress_changes) as f:
+                names = [Path(row["forcing"]).name for row in csv.DictReader(f)]
+            required_calibration_files += [self.stress_folder / name for name in names]
     return _validate_files(required_calibration_files, log_level)

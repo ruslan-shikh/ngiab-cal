@@ -10,6 +10,7 @@ A Python CLI tool to simplify hydrologic model calibration for NextGen In A Box 
 - [Advanced Options](#advanced-options)
 - [Calibration Process](#calibration-process)
 - [Calibrating for Floods](#calibrating-for-floods)
+- [Stress Testing a Calibration](#stress-testing-a-calibration)
 - [Calibration Configuration File](#calibration-configuration-file)
 - [Example: Calibrating CAMELS Basins](#example-calibrating-camels-basins)
 - [How It Works](#how-it-works)
@@ -76,8 +77,11 @@ ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID -f
 
 ```
 usage: ngiab-cal [-h] [-g GAGE] [-f] [--run] [-i ITERATIONS] [--debug] [-w WARMUP]
-                 [--calibration_ratio CALIBRATION_RATIO] [--objective {kge,kge-flood}]
-                 [--flood-weight FLOOD_WEIGHT] [--q2-cfs Q2_CFS]
+                 [--calibration_ratio CALIBRATION_RATIO]
+                 [--objective {kge,kge-flood,kge-flood-robust}] [--flood-weight FLOOD_WEIGHT]
+                 [--q2-cfs Q2_CFS] [--storm-depth STORM_DEPTH]
+                 [--storm-concentration STORM_CONCENTRATION] [--stress-test]
+                 [--stress-depth STRESS_DEPTH] [--stress-concentration STRESS_CONCENTRATION]
                  data_folder
 
 Create a calibration config for ngen-cal
@@ -102,11 +106,13 @@ options:
                         Default:0.5
                         How to split time after warmup into calibration and validation.
                         1 == 100% calibration, 0 == 100% validation, 0.8 == 80% calibration 20% validation
-  --objective {kge,kge-flood}
+  --objective {kge,kge-flood,kge-flood-robust}
                         Default:kge
                         What the calibration minimizes:
-                          kge        1 - KGE
-                          kge-flood  (1 - w)(1 - KGE) + w * the mean peak error of the calibration floods
+                          kge               1 - KGE
+                          kge-flood         (1 - w)(1 - KGE) + w * the mean peak error of the calibration floods
+                          kge-flood-robust  as kge-flood, but each flood's error is its largest |ln(sim/obs)|
+                                            over three runs: the forcing as it is, a drier and a wetter copy
                         A flood is an independent peak above the 2-year flood. Its peak error is
                         |sim - obs| / obs, where sim is the largest simulated flow within 7 days either
                         side of the observed peak
@@ -117,6 +123,40 @@ options:
 
   --q2-cfs Q2_CFS       The gage's 2-year flood in ft3/s, e.g. a Bulletin 17C estimate from PeakFQ.
                         Default: the median of the gage's annual peaks from USGS
+
+  --storm-depth STORM_DEPTH
+                        Default:1.4
+                        d >= 1, for kge-flood-robust. The drier copy scales the rain of each calibration
+                        flood's storm to 1/d, the wetter one to d times
+
+  --storm-concentration STORM_CONCENTRATION
+                        Default:1.2
+                        g >= 1, for kge-flood-robust. Changes how a storm's rain is spread over its hours,
+                        keeping its total. The drier copy raises each hour's rain to the power 1/g, which
+                        spreads the storm out, and the wetter one to the power g, which packs it into the
+                        heaviest hours. A dry hour stays dry
+
+  --stress-test         After calibrating, rerun the best parameters with the storms of the validation
+                        period's floods changed, and report each flood's peak error under every change:
+                        depth in ten equal log steps down to 1/D and ten up to D, and concentration at
+                        1/G and G, alone and with each end of depth (up to 26 runs). The calibration
+                        itself does not change
+
+  --stress-depth STRESS_DEPTH
+                        Default:1.6
+                        D >= 1, the largest depth change in the stress test
+
+  --stress-concentration STRESS_CONCENTRATION
+                        Default:1.5
+                        G >= 1, the largest concentration change in the stress test, applied as for
+                        --storm-concentration
+
+
+                 Default calibration settings on a 5 year period
+        |   year 1   |   year 2   |   year 3   |   year 4   |   year 5   |
+        |<- warmup ->|<-     calibration     ->|      no simulation      |
+        |<-             warmup               ->|<-      validation     ->|
+
 ```
 
 ## Calibration Process
@@ -151,6 +191,29 @@ ngiab-cal finds the floods in the gage's hourly record and lists them in `calibr
 - A flood is left out if its peak hour or the hour on either side is missing or estimated. Gages often lose data at their largest floods, so ngiab-cal logs each flood it leaves out.
 
 ngiab-cal stops with an error if the calibration period has no flood, and warns if it has fewer than three, since the flood term then rests on very few peaks.
+
+### Calibrating for storms the forcing gets wrong
+
+`--objective kge-flood-robust` runs every iteration three times: with the forcing as it is, with a drier copy and with a wetter copy. The copies, `calibration/storm_dry.nc` and `calibration/storm_wet.nc`, change only the rain within seven days either side of each calibration flood's peak:
+
+- `--storm-depth` d scales each storm's total rain to 1/d in the drier copy and d times in the wetter one.
+- `--storm-concentration` g changes how the rain is spread over the storm's hours. The wetter copy raises each hour's rain to the power g and the drier copy to the power 1/g, then rescales it to keep the storm's total, so the drier copy spreads the rain out and the wetter one packs it into the heaviest hours. Dry hours stay dry.
+
+Each flood's error is then its largest |ln(sim / obs)| over the three runs, and E is the mean of these. KGE still comes from the original forcing. The defaults (d = 1.4, g = 1.2) come from comparing AORC with two MRMS rain products at the flood storms of seven test basins. At each basin, d and g are the typical departure from AORC of whichever product departs further, usually the radar-only one, and the defaults are their medians over the basins. They measure how much rain products disagree, not a known error in AORC. The forcing must be NetCDF, as the NGIAB preprocessor writes it. Each iteration runs three models, so it needs up to three times the cores or time of a `kge-flood` iteration.
+
+```bash
+ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --objective kge-flood-robust
+```
+
+## Stress Testing a Calibration
+
+`--stress-test` checks how a calibration's flood peaks hold up when the storms in the forcing are wrong. It works with any `--objective` and does not change the calibration. After the validation run, it reruns the best parameters with the storms of the validation period's floods changed by up to `--stress-depth` and `--stress-concentration`. Their defaults (1.6 and 1.5) are the medians over the same seven basins of that product's largest departure from AORC. The results go to `<gage>_stress_*_valid_best.csv` in `calibration/Output/Validation_Run`: each flood's peak error under every change, KGE under every change, and a summary per flood.
+
+```bash
+ngiab-cal /path/to/ngiab/data/folder -g USGS_GAGE_ID --stress-test
+```
+
+ngiab-cal writes up to 26 changed copies of the forcing to `calibration/stress/` before the calibration starts, and the run reads them at its end, so keep them until it finishes. If one is missing, the next `ngiab-cal` run on the folder finds the configuration incomplete and writes it again from the options you give it, even without `--force`.
 
 ## Example: Calibrating CAMELS Basins
 
@@ -225,13 +288,17 @@ eval_params:
   site_name: "USGS 01646500: "  # Label for plots
 ```
 
-`--objective kge-flood` sets:
+A flood objective or `--stress-test` sets:
 
 ```yaml
 eval_params:
-  objective: kge_flood
+  objective: kge_flood_robust
   floods: /ngen/ngen/data/calibration/floods.csv
   flood_weight: 0.5
+  storm_forcings:  # kge-flood-robust
+    - /ngen/ngen/data/calibration/storm_dry.nc
+    - /ngen/ngen/data/calibration/storm_wet.nc
+  stress_test: /ngen/ngen/data/calibration/stress/changes.csv  # --stress-test
 ```
 
 These time periods follow the calibration process diagram shown earlier, with separate periods for warmup, calibration, and validation.
@@ -261,7 +328,7 @@ ngiab-cal has several important limitations to be aware of:
 
 2. **Limited Model Support**: Only calibrates parameters for CFE (Conceptual Functional Equivalent) and NoahOWP-Modular hydrologic models. Other models in the NextGen framework are not currently supported.
 
-3. **Single-Gage Calibration**: Designed for calibrating single-basin models using one USGS streamgage. Multi-gage calibration is not supported, and the flood objective combines KGE and the flood peaks into one weighted score rather than a multi-objective search.
+3. **Single-Gage Calibration**: Designed for calibrating single-basin models using one USGS streamgage. Multi-gage calibration is not supported, and the flood objectives combine KGE and the flood peaks into one weighted score rather than a multi-objective search.
 
 4. **Custom ngen-cal Branch**: Uses a modified version of ngen-cal from the `ngiab_cal` branch, which differs from the main branch. Features from newer releases of ngen-cal may not be available.
 

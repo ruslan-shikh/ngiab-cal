@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import datetime
 from unittest.mock import MagicMock
@@ -5,22 +6,30 @@ from unittest.mock import MagicMock
 import numpy as np
 import pandas as pd
 import pytest
+import xarray as xr
 import yaml
 
 from ngiab_cal import __main__ as cli
 from ngiab_cal.arguments import check_objective_arguments, get_arg_parser
-from ngiab_cal.file_paths import FilePaths
+from ngiab_cal.file_paths import FilePaths, validate_calibration_files
 
 START, END = datetime(2020, 1, 1), datetime(2020, 2, 9, 23)
 CALIBRATION_PERIOD = (datetime(2020, 1, 11), datetime(2020, 1, 26))
+VALIDATION_PERIOD = (CALIBRATION_PERIOD[1], END)
 GAGE = "01234567"
 
 
 @pytest.fixture
-def files(tmp_path) -> FilePaths:
-    """Create a package whose hydrofabric places the gage on a 1 mi2 flowpath."""
+def files(tmp_path, forcing_file) -> FilePaths:
+    """Create a package with a NetCDF forcing, whose hydrofabric places the gage on a 1 mi2
+    flowpath."""
     (tmp_path / "config").mkdir()
     (tmp_path / "calibration").mkdir()
+    (tmp_path / "config" / "realization.json").write_text(
+        json.dumps(
+            {"global": {"forcing": {"path": "./forcings/forcings.nc", "provider": "NetCDF"}}}
+        )
+    )
     with sqlite3.connect(tmp_path / "config" / f"{tmp_path.name}_subset.gpkg") as con:
         con.execute("CREATE TABLE flowpaths (id TEXT, tot_drainage_areasqkm REAL)")
         con.execute("CREATE TABLE 'flowpath-attributes' (id TEXT, gage TEXT)")
@@ -39,11 +48,17 @@ def observed() -> pd.DataFrame:
     return pd.DataFrame({"value_date": times, "obs_flow": flow, "estimated": False})
 
 
-def write_floods(files: FilePaths, period=CALIBRATION_PERIOD) -> str:
-    # a 2-year flood of 353 ft3/s is 10 m3/s, below all three floods
-    return cli.write_flood_objective_files(
-        files, GAGE, observed(), period=period, flood_weight=0.25, q2_cfs=353.0
-    )
+def write(files: FilePaths, **settings) -> str:
+    """Write the flood files; a 2-year flood of 353 ft3/s is 10 m3/s, below all three floods."""
+    settings = {
+        "period": CALIBRATION_PERIOD,
+        "objective": "kge-flood",
+        "flood_weight": 0.25,
+        "q2_cfs": 353.0,
+        "storm_depth": 1.6,
+        "storm_concentration": 1.2,
+    } | settings
+    return cli.write_flood_objective_files(files, GAGE, observed(), **settings)
 
 
 def eval_params(files: FilePaths, objective: str = "kge", flood_settings: str = "") -> dict:
@@ -53,14 +68,21 @@ def eval_params(files: FilePaths, objective: str = "kge", flood_settings: str = 
     return yaml.safe_load(files.calibration_config.read_text())["model"]["eval_params"]
 
 
+def changed_hours(original, changed, hours) -> pd.DatetimeIndex:
+    """Return the hours at which any catchment's precipitation differs between two forcings."""
+    with xr.open_dataset(original) as a, xr.open_dataset(changed) as b:
+        return hours[(a["precip_rate"] != b["precip_rate"]).any("catchment-id").values]
+
+
 def test_the_default_config_has_no_flood_settings(files):
     params = eval_params(files)
     assert params["objective"] == "kge"
     assert "floods" not in params and "flood_weight" not in params
 
 
-def test_kge_flood_writes_the_flood_list_and_points_ngen_cal_at_it(files, caplog):
-    params = eval_params(files, "kge-flood", write_floods(files))
+def test_kge_flood_writes_the_flood_list_and_no_forcing(files, caplog):
+    settings = write(files)
+    params = eval_params(files, "kge-flood", settings)
     assert "Fewer than 3 floods in the calibration period" in caplog.text
     listed = pd.read_csv(files.floods)
     assert listed["peak_time"].tolist() == [
@@ -71,11 +93,77 @@ def test_kge_flood_writes_the_flood_list_and_points_ngen_cal_at_it(files, caplog
     assert params["objective"] == "kge_flood"
     assert params["floods"] == "/ngen/ngen/data/calibration/floods.csv"
     assert params["flood_weight"] == 0.25
+    assert "storm_forcings" not in params
+    assert not files.drier_forcing.exists() and not files.wetter_forcing.exists()
 
 
 def test_kge_flood_stops_if_the_calibration_period_has_no_flood(files):
     with pytest.raises(ValueError, match="calibration period"):
-        write_floods(files, period=(datetime(2020, 1, 20), datetime(2020, 1, 30)))
+        write(files, period=(datetime(2020, 1, 20), datetime(2020, 1, 30)))
+
+
+def test_kge_flood_robust_changes_only_the_calibration_storms(files, hours):
+    params = eval_params(files, "kge-flood-robust", write(files, objective="kge-flood-robust"))
+    assert params["objective"] == "kge_flood_robust"
+    assert params["storm_forcings"] == [
+        "/ngen/ngen/data/calibration/storm_dry.nc",
+        "/ngen/ngen/data/calibration/storm_wet.nc",
+    ]
+    # only the storm of the flood peaking on 2020-01-18 12:00 changes
+    changed = changed_hours(cli.netcdf_forcing(files), files.drier_forcing, hours)
+    assert changed.min() >= pd.Timestamp("2020-01-11 12:00")
+    assert changed.max() <= pd.Timestamp("2020-01-25 12:00")
+
+
+def test_the_stress_test_changes_only_the_validation_storms(files, hours):
+    settings = write(files, objective="kge", stress=(1.6, 1.2), validation_period=VALIDATION_PERIOD)
+    params = eval_params(files, "kge", settings)
+    assert params["objective"] == "kge"
+    assert params["stress_test"] == "/ngen/ngen/data/calibration/stress/changes.csv"
+    assert "storm_forcings" not in params
+    changes = pd.read_csv(files.stress_changes)
+    assert len(changes) == 26 == len(list(files.stress_folder.glob("stress_*.nc")))
+    assert changes["forcing"].iloc[0] == "/ngen/ngen/data/calibration/stress/stress_01.nc"
+    # only the storm of the flood peaking on 2020-02-03 changes
+    changed = changed_hours(cli.netcdf_forcing(files), files.stress_folder / "stress_20.nc", hours)
+    assert changed.min() >= pd.Timestamp("2020-01-27 00:00")
+
+
+def test_the_stress_test_needs_a_validation_flood_but_not_a_calibration_flood(files):
+    no_flood = (datetime(2020, 1, 20), datetime(2020, 1, 30))
+    with_kge = write(
+        files,
+        objective="kge",
+        period=no_flood,
+        stress=(1.6, 1.2),
+        validation_period=(no_flood[1], END),
+    )
+    assert "stress_test" in with_kge
+    with pytest.raises(ValueError, match="validation period"):
+        write(files, stress=(1.6, 1.2), validation_period=(datetime(2020, 1, 26), no_flood[1]))
+
+
+def test_a_missing_storm_forcing_makes_the_config_invalid(files):
+    settings = write(
+        files,
+        objective="kge-flood-robust",
+        stress=(1.6, 1.2),
+        validation_period=VALIDATION_PERIOD,
+    )
+    eval_params(files, "kge-flood-robust", settings)
+    for path in (
+        files.calibration_realization,
+        files.calibration_troute,
+        files.crosswalk,
+        files.observed_discharge,
+    ):
+        path.touch()
+    assert validate_calibration_files(files)
+    for name in ("storm_wet.nc", "stress/changes.csv", "stress/stress_26.nc"):
+        path = files.calibration_folder / name
+        path.rename(path.with_suffix(".bak"))
+        assert not validate_calibration_files(files), name
+        path.with_suffix(".bak").rename(path)
 
 
 def test_estimated_values_are_flagged_but_not_written(tmp_path, monkeypatch):
@@ -94,17 +182,24 @@ def test_estimated_values_are_flagged_but_not_written(tmp_path, monkeypatch):
     assert pd.read_csv(tmp_path / "obs.csv").columns.tolist() == ["value_date", "obs_flow"]
 
 
-def test_flood_arguments_are_checked():
+def test_flood_and_storm_arguments_are_checked():
     parser = get_arg_parser()
 
     def check(*argv):
         check_objective_arguments(parser, parser.parse_args(["folder", *argv]))
 
     check("--objective", "kge-flood", "--flood-weight", "0.3", "--q2-cfs", "300")
+    check("--objective", "kge-flood-robust", "--storm-depth", "1.6", "--storm-concentration", "1")
+    check("--stress-test", "--q2-cfs", "300", "--stress-depth", "1", "--stress-concentration", "2")
     for wrong in (
         ["--objective", "kge-flood", "--flood-weight", "1.5"],
-        ["--objective", "kge-flood", "--q2-cfs", "0"],
-        ["--flood-weight", "0.3"],  # only kge-flood uses it
+        ["--objective", "kge-flood-robust", "--storm-depth", "0.8"],  # must be >= 1
+        ["--objective", "kge-flood-robust", "--storm-depth", "1", "--storm-concentration", "1"],
+        ["--stress-test", "--stress-depth", "1", "--stress-concentration", "1"],  # no change
+        ["--stress-test", "--calibration_ratio", "1"],  # no validation period
+        ["--flood-weight", "0.3"],  # only the flood objectives use it
+        ["--objective", "kge-flood", "--storm-depth", "1.6"],  # only kge-flood-robust uses it
+        ["--stress-depth", "2"],  # only --stress-test uses it
     ):
         with pytest.raises(SystemExit):
             check(*wrong)
